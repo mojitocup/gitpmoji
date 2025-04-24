@@ -182,6 +182,11 @@ aws_signed_request() {
   local data=$1
   local response
   
+  if [ "$VERBOSE" = true ]; then
+    echo -e "Sending request to Bedrock API with data:"
+    echo "$data" | jq '.'
+  fi
+  
   # Use AWS CLI to call Bedrock
   response=$(AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
              AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
@@ -190,7 +195,20 @@ aws_signed_request() {
              --model-id $BEDROCK_MODEL \
              --content-type "application/json" \
              --body "$data" \
-             /dev/stdout)
+             /dev/stdout 2>&1)
+  
+  # Check if there was an AWS CLI error
+  local aws_exit_code=$?
+  if [ $aws_exit_code -ne 0 ]; then
+    echo -e "AWS CLI ERROR: aws bedrock-runtime invoke-model failed with exit code $aws_exit_code"
+    echo -e "ERROR DETAILS: $response"
+    exit 1
+  fi
+  
+  if [ "$VERBOSE" = true ]; then
+    echo -e "Received response from Bedrock API:"
+    echo "$response" | jq '.' 2>/dev/null || echo "$response"
+  fi
   
   echo "$response"
 }
@@ -205,6 +223,12 @@ check_for_errors() {
       echo -e "RESPONSE: $response"
       exit 1
     fi
+    
+    # For debugging, if verbose mode is on, show the full structure
+    if [ "$VERBOSE" = true ]; then
+      echo -e "Parsed Bedrock response structure:"
+      echo "$response" | jq '.'
+    fi
   else
     # Check for OpenAI API errors
     ERROR=$(echo $response | jq -r '.error.message')
@@ -217,6 +241,20 @@ check_for_errors() {
       exit 1
     fi
   fi
+}
+
+# Helper function to extract content from Bedrock Claude responses
+extract_bedrock_content() {
+  local response=$1
+  # Try multiple possible response formats for different Claude models/versions
+  local content=$(echo "$response" | jq -r '.completion // .content[0].text // .results[0].outputText // ""')
+  
+  # Claude 3 Sonnet Bedrock specific format (messages array)
+  if [[ -z "$content" || "$content" == "null" ]]; then
+    content=$(echo "$response" | jq -r '.messages[-1].content[0].text // ""')
+  fi
+  
+  echo "$content"
 }
 
 generate_message() {
@@ -259,13 +297,33 @@ generate_message() {
     
     DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$DIFF_CONTENT" "$BEDROCK_JSON")
     
+    if [ "$VERBOSE" = true ]; then
+      echo -e "Bedrock model being used: $BEDROCK_MODEL"
+      echo -e "Request data structure:"
+      echo "$DATA" | jq '.'
+    fi
+    
     # Make the API call to AWS Bedrock
     RESPONSE=$(aws_signed_request "$DATA")
     
     check_for_errors "$RESPONSE"
     
     # Extract and display the answer from Claude response
-    GPT_MESSAGE=$(echo $RESPONSE | jq -r '.content[0].text')
+    if [ "$VERBOSE" = true ]; then
+      echo -e "Extracting message from Bedrock response..."
+      echo -e "Response structure: $(echo $RESPONSE | jq -r 'keys')"
+    fi
+    
+    # Use the helper function to extract content
+    GPT_MESSAGE=$(extract_bedrock_content "$RESPONSE")
+    
+    if [ "$VERBOSE" = true ]; then
+      echo -e "Extracted message: $GPT_MESSAGE"
+      if [ -z "$GPT_MESSAGE" ]; then
+        echo -e "WARNING: Failed to extract message from response. Full response:"
+        echo "$RESPONSE" | jq '.'
+      fi
+    fi
   else
     # Original OpenAI API call
     JSON='{
@@ -411,13 +469,33 @@ generate_emoji() {
     
     DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$MESSAGE" "$BEDROCK_JSON")
     
+    if [ "$VERBOSE" = true ]; then
+      echo -e "Bedrock model being used: $BEDROCK_MODEL"
+      echo -e "Request data structure:"
+      echo "$DATA" | jq '.'
+    fi
+    
     # Make the API call to AWS Bedrock
     RESPONSE=$(aws_signed_request "$DATA")
     
     check_for_errors "$RESPONSE"
     
     # Extract and display the answer from Claude response
-    EMOJI=$(echo $RESPONSE | jq -r '.content[0].text')
+    if [ "$VERBOSE" = true ]; then
+      echo -e "Extracting emoji from Bedrock response..."
+      echo -e "Response structure: $(echo $RESPONSE | jq -r 'keys')"
+    fi
+    
+    # Use the helper function to extract content
+    EMOJI=$(extract_bedrock_content "$RESPONSE")
+    
+    if [ "$VERBOSE" = true ]; then
+      echo -e "Extracted emoji: $EMOJI"
+      if [ -z "$EMOJI" ]; then
+        echo -e "WARNING: Failed to extract emoji from response. Full response:"
+        echo "$RESPONSE" | jq '.'
+      fi
+    fi
   else
     # Original OpenAI API call
     JSON='{
@@ -526,13 +604,33 @@ assess_diff() {
     
     DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$DIFF_CONTENT" "$BEDROCK_JSON")
     
+    if [ "$VERBOSE" = true ]; then
+      echo -e "Bedrock model being used: $BEDROCK_MODEL"
+      echo -e "Request data structure:"
+      echo "$DATA" | jq '.'
+    fi
+    
     # Make the API call to AWS Bedrock
     RESPONSE=$(aws_signed_request "$DATA")
     
     check_for_errors "$RESPONSE"
     
     # Extract and display the answer from Claude response
-    GPT_MESSAGE=$(echo $RESPONSE | jq -r '.content[0].text')
+    if [ "$VERBOSE" = true ]; then
+      echo -e "Extracting assessment from Bedrock response..."
+      echo -e "Response structure: $(echo $RESPONSE | jq -r 'keys')"
+    fi
+    
+    # Use the helper function to extract content
+    GPT_MESSAGE=$(extract_bedrock_content "$RESPONSE")
+    
+    if [ "$VERBOSE" = true ]; then
+      echo -e "Extracted assessment: $GPT_MESSAGE"
+      if [ -z "$GPT_MESSAGE" ]; then
+        echo -e "WARNING: Failed to extract assessment from response. Full response:"
+        echo "$RESPONSE" | jq '.'
+      fi
+    fi
   else
     # Original OpenAI API call
     JSON='{
@@ -591,3 +689,17 @@ fi
 
 echo -e "${RESULT}"
 exit 0
+
+# Debugging tips:
+# 1. Run with -v flag to see verbose output
+# 2. For AWS Bedrock issues:
+#    - Check AWS credentials are correctly set (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)
+#    - Verify the AWS_REGION is correct (default: us-east-1)
+#    - Ensure the model ID is valid and accessible with your AWS account
+#    - Try the aws cli command manually to test connection:
+#      aws bedrock list-foundation-models --region us-east-1
+#
+# 3. Common model IDs:
+#    - Claude 3 Sonnet: anthropic.claude-3-sonnet-20240229-v1:0
+#    - Claude 3 Haiku: anthropic.claude-3-haiku-20240307-v1:0
+#    - Claude 2: anthropic.claude-v2:1
