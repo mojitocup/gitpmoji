@@ -181,11 +181,10 @@ get_diff_content() {
 aws_signed_request() {
   local data=$1
   local response
+  local encoded_data
   
-  if [ "$VERBOSE" = true ]; then
-    echo -e "Sending request to Bedrock API with data:"
-    echo "$data" | jq '.'
-  fi
+  # Base64 encode the JSON data
+  encoded_data=$(echo -n "$data" | base64 -w 0)
   
   # Use AWS CLI to call Bedrock
   response=$(AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
@@ -194,7 +193,7 @@ aws_signed_request() {
              --region $AWS_REGION \
              --model-id $BEDROCK_MODEL \
              --content-type "application/json" \
-             --body "$data" \
+             --body "$encoded_data" \
              /dev/stdout 2>&1)
   
   # Check if there was an AWS CLI error
@@ -202,32 +201,25 @@ aws_signed_request() {
   if [ $aws_exit_code -ne 0 ]; then
     echo -e "AWS CLI ERROR: aws bedrock-runtime invoke-model failed with exit code $aws_exit_code"
     echo -e "ERROR DETAILS: $response"
+    if [ "$VERBOSE" = true ]; then
+      echo -e "JSON sent to AWS Bedrock:"
+      echo "$data" | jq '.'
+    fi
     exit 1
   fi
-  
-  if [ "$VERBOSE" = true ]; then
-    echo -e "Received response from Bedrock API:"
-    echo "$response" | jq '.' 2>/dev/null || echo "$response"
-  fi
-  
-  echo "$response"
+
+  local result=$(echo $response | jq -r .content[0].text)
+  echo "$result"  # Return the result
 }
 
 check_for_errors() {
   local response=$1
   if [ "$USE_BEDROCK" = "true" ]; then
-    # Check for Bedrock API errors
-    ERROR=$(echo $response | jq -r '.error // ""')
-    if [ -n "$ERROR" ] && [ "$ERROR" != "null" ]; then
-      echo -e "ERROR: $ERROR"
-      echo -e "RESPONSE: $response"
-      exit 1
-    fi
-    
+
+ 
     # For debugging, if verbose mode is on, show the full structure
     if [ "$VERBOSE" = true ]; then
-      echo -e "Parsed Bedrock response structure:"
-      echo "$response" | jq '.'
+      echo "$response" 
     fi
   else
     # Check for OpenAI API errors
@@ -259,7 +251,7 @@ extract_bedrock_content() {
 
 generate_message() {
   if [ "$VERBOSE" = true ]; then
-    echo -e "generate_message"
+    echo -e "generate_message *******************************************************************"
   fi
 
   get_diff_content
@@ -277,25 +269,31 @@ generate_message() {
   PREFIX_RX="\"" 
 
   if [ "$USE_BEDROCK" = "true" ]; then
-    # Prepare data for Bedrock Claude API
-    BEDROCK_JSON='{
-      "anthropic_version": "bedrock-2023-05-31",
-      "max_tokens": 200,
-      "temperature": 0.999,
-      "top_p": 1,
-      "messages": [
-        {
-          "role": "system",
-          "content": $system_prompt
-        },
-        {
-          "role": "user",
-          "content": $prompt
-        }
-      ]
-    }'
+    # Prepare data for Bedrock Claude API using jq to properly escape values
+    # Note: Claude on Bedrock does not support system messages
+    # We'll prepend the system prompt to the user text as a workaround
+    combined_text="$SYSTEM_PROMPT
+
+$MESSAGE"
     
-    DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$DIFF_CONTENT" "$BEDROCK_JSON")
+    DATA=$(jq -n \
+           --arg version "bedrock-2023-05-31" \
+           --arg text "$combined_text" \
+           '{
+             anthropic_version: $version,
+             max_tokens: 500,
+             messages: [
+               {
+                 role: "user",
+                 content: [
+                   {
+                     type: "text",
+                     text: $text
+                   }
+                 ]
+               }
+             ]
+           }')
     
     if [ "$VERBOSE" = true ]; then
       echo -e "Bedrock model being used: $BEDROCK_MODEL"
@@ -368,186 +366,9 @@ generate_message() {
   RESULT=$(echo -e "${MESSAGE}")
 }
 
-generate_emoji() {
-  if [ "$VERBOSE" = true ]; then
-    echo -e "generate_emoji"
-  fi
-
-  # Prepare the data for the API call
-  SYSTEM_PROMPT="You are a system that generates emoji for incoming messages.
-  You will be given a message and your task is to generate an emoji that best represents the message.
-  You will provide only one emoji for each message.
-  Your answer should contain only single emoji, nothing else.
-  If possible, use the emoji that is already in the message.
-  If possible, use the emoji from the list below:
-  | Emoji | Message |
-  |-------|-------------|
-  | 🎉 | Begin a project. start new priject. initial commit |
-  | 🪲 | Fix a bug. bugfix |
-  | 🚑 | Critical bug fix. hotfix. |
-  | ✨ | Introduce new features. |
-  | 📝 | Add or update documentation. |
-  | 🚀 | Deploy stuff. |
-  | 💄 | Add or update the UI and style files. |
-  | 🎨 | Improve structure. cosmetic changes |
-  | 🧹 | Run linter or formatter |
-  | ⚡ | Improve performance. |
-  | 🗑️ | Deprecate code. Remove code or files.|
-  | ✅ | Add, update, or pass tests. unit-tests |
-  | 🔒 | Fix security issues. |
-  | 🔐 | Add or update secrets. |
-  | 🔖 | Release / Version tags. |
-  | 🚨 | Fix compiler / linter warnings. |
-  | 🚧 | Work in progress. |
-  | 💚 | Fix CI Build. |
-  | ⬇️ | Downgrade dependencies. |
-  | ⬆️ | Upgrade dependencies. |
-  | 📌 | Pin dependencies to specific versions. |
-  | 👷 | Add or update CI build system. |
-  | 📈 | Add or update analytics. |
-  | ♻️ | Refactor code. |
-  | ➕ | Add a dependency. |
-  | ➖ | Remove a dependency. |
-  | 🔧 | Add or update configuration files. |
-  | 🔨 | Add or update development scripts. |
-  | 🌐 | Internationalization and localization. |
-  | ✏️ | Fix typos. |
-  | ⏪ | Revert changes. |
-  | 🔀 | Merge branches. |
-  | 📦 | Add or update compiled files or packages. |
-  | 👽 | Update code due to external API changes. |
-  | 🚚 | Move or rename resources. |
-  | 📄 | Add or update license. |
-  | 💥 | Introduce breaking changes. |
-  | 🍱 | Add or update assets. |
-  | ♿ | Add or improve accessibility. |
-  | 💡 | Add or update comments in source code. |
-  | 🗯 | Add or update text and literals. |
-  | 🗃 | Perform database changes. |
-  | 👥 | Add or update contributor(s). |
-  | 🚸 | Improve user experience. |
-  | 🏗 | Make architectural changes. |
-  | 📱 | Work on responsive design. |
-  | 🤡 | Mock things. |
-  | 🙈 | Add or update a .gitignore file. |
-  | 📸 | Add or update snapshots. |
-  | 🏷️ | Add or update types. |
-  | 🚩 | Add or update feature flags. |
-  | 🥅 | Catch errors. |
-  | 💫 | Add or update animations. |
-  | 🛂 | Work on authorization. |
-  | 🩹 | Simple fix for a non-critical issue. |
-  | 🧐 | Data exploration/inspection. |
-  | ⚰️ | Remove dead code. |
-  | 🧪 | Add a failing test. |
-  | 👔 | Add or update business logic. |
-  | 🩺 | Add or update healthcheck. |
-  | 🧱 | Infrastructure changes. |
-  | 🧑‍💻 | Improve developer experience. |
-  "
-
-  PREFIX_RX="\"" 
-
-  if [ "$USE_BEDROCK" = "true" ]; then
-    # Prepare data for Bedrock Claude API
-    BEDROCK_JSON='{
-      "anthropic_version": "bedrock-2023-05-31",
-      "max_tokens": 100,
-      "temperature": 0.999,
-      "top_p": 1,
-      "messages": [
-        {
-          "role": "system",
-          "content": $system_prompt
-        },
-        {
-          "role": "user",
-          "content": $prompt
-        }
-      ]
-    }'
-    
-    DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$MESSAGE" "$BEDROCK_JSON")
-    
-    if [ "$VERBOSE" = true ]; then
-      echo -e "Bedrock model being used: $BEDROCK_MODEL"
-      echo -e "Request data structure:"
-      echo "$DATA" | jq '.'
-    fi
-    
-    # Make the API call to AWS Bedrock
-    RESPONSE=$(aws_signed_request "$DATA")
-    
-    check_for_errors "$RESPONSE"
-    
-    # Extract and display the answer from Claude response
-    if [ "$VERBOSE" = true ]; then
-      echo -e "Extracting emoji from Bedrock response..."
-      echo -e "Response structure: $(echo $RESPONSE | jq -r 'keys')"
-    fi
-    
-    # Use the helper function to extract content
-    EMOJI=$(extract_bedrock_content "$RESPONSE")
-    
-    if [ "$VERBOSE" = true ]; then
-      echo -e "Extracted emoji: $EMOJI"
-      if [ -z "$EMOJI" ]; then
-        echo -e "WARNING: Failed to extract emoji from response. Full response:"
-        echo "$RESPONSE" | jq '.'
-      fi
-    fi
-  else
-    # Original OpenAI API call
-    JSON='{
-      "model": $api_model,
-      "messages": [
-        {
-          "role": "system",
-          "content": $system_prompt
-        },
-        {
-          "role": "user",
-          "content": $prompt
-        }
-      ],
-      "max_tokens": 100,
-      "temperature": 0.999,
-      "top_p": 1,
-      "frequency_penalty": 0.0,
-      "presence_penalty": 0.0
-    }'
-
-    DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$MESSAGE" --arg api_model "$API_MODEL" "$JSON")
-
-    # Make the API call to OpenAI
-    RESPONSE=$(curl -s \
-                    -X POST "$API_BASE_URL/chat/completions" \
-                    -H "Content-Type: application/json" \
-                    -H "Authorization: Bearer $API_KEY" \
-                    -d "$DATA")
-
-    check_for_errors "$RESPONSE"
-
-    # Extract and display the answer
-    EMOJI=$(echo $RESPONSE | jq -r '.choices[0].message.content' | sed 's/^"//;s/"$//')
-  fi
-
-  PREFIX="###"
-
-  # check if GITPMOJI_PREFIX_RX is set
-  GITPMOJI_PREFIX_RX=$GITPMOJI_PREFIX_RX
-  if [ -z "$GITPMOJI_PREFIX_RX" ]; then
-      PREFIX="###"
-  else
-      PREFIX=$GITPMOJI_PREFIX_RX
-  fi
-
-  RESULT=$(echo -e "${MESSAGE}" | sed "1s/^\($PREFIX\)\{0,1\}\(.*\)$/\1$EMOJI \2/")
-}
-
 assess_diff() {
   if [ "$VERBOSE" = true ]; then
-    echo -e "assess_diff"
+    echo -e "assess_diff *******************************************************************"
   fi
 
   get_diff_content
@@ -562,8 +383,6 @@ assess_diff() {
   Use multiple lines for the response.
   Try to use maximum 250 words in the response.
   Add the final rating on the scale from 1 to 10 at the end of the response.
-  Use 10 emoji ⭐ and 💩 to indicate the rating.
-  For example: ⭐⭐⭐⭐⭐⭐⭐💩💩💩 means 7 out of 10 and ⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐ means 10 out of 10.
   "
 
   if [ "$RATING" = true ]; then
@@ -584,25 +403,31 @@ assess_diff() {
   fi
 
   if [ "$USE_BEDROCK" = "true" ]; then
-    # Prepare data for Bedrock Claude API
-    BEDROCK_JSON='{
-      "anthropic_version": "bedrock-2023-05-31",
-      "max_tokens": 500,
-      "temperature": 1,
-      "top_p": 1,
-      "messages": [
-        {
-          "role": "system",
-          "content": $system_prompt
-        },
-        {
-          "role": "user",
-          "content": $prompt
-        }
-      ]
-    }'
+    # Prepare data for Bedrock Claude API using jq to properly escape values
+    # Note: Claude on Bedrock does not support system messages
+    # We'll prepend the system prompt to the user text as a workaround
+    combined_text="$SYSTEM_PROMPT
+
+$DIFF_CONTENT"
     
-    DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$DIFF_CONTENT" "$BEDROCK_JSON")
+    DATA=$(jq -n \
+           --arg version "bedrock-2023-05-31" \
+           --arg text "$combined_text" \
+           '{
+             anthropic_version: $version,
+             max_tokens: 500,
+             messages: [
+               {
+                 role: "user",
+                 content: [
+                   {
+                     type: "text",
+                     text: $text
+                   }
+                 ]
+               }
+             ]
+           }')
     
     if [ "$VERBOSE" = true ]; then
       echo -e "Bedrock model being used: $BEDROCK_MODEL"
@@ -612,66 +437,10 @@ assess_diff() {
     
     # Make the API call to AWS Bedrock
     RESPONSE=$(aws_signed_request "$DATA")
-    
-    check_for_errors "$RESPONSE"
-    
-    # Extract and display the answer from Claude response
-    if [ "$VERBOSE" = true ]; then
-      echo -e "Extracting assessment from Bedrock response..."
-      echo -e "Response structure: $(echo $RESPONSE | jq -r 'keys')"
-    fi
-    
-    # Use the helper function to extract content
-    GPT_MESSAGE=$(extract_bedrock_content "$RESPONSE")
-    
-    if [ "$VERBOSE" = true ]; then
-      echo -e "Extracted assessment: $GPT_MESSAGE"
-      if [ -z "$GPT_MESSAGE" ]; then
-        echo -e "WARNING: Failed to extract assessment from response. Full response:"
-        echo "$RESPONSE" | jq '.'
-      fi
-    fi
-  else
-    # Original OpenAI API call
-    JSON='{
-      "model": $api_model,
-      "messages": [
-        {
-          "role": "system",
-          "content": $system_prompt
-        },
-        {
-          "role": "user",
-          "content": $prompt
-        }
-      ],
-      "max_tokens": 500,
-      "temperature": 1,
-      "top_p": 1,
-      "frequency_penalty": 0.0,
-      "presence_penalty": 0.0
-    }'
+    RESULT="$RESPONSE"  # Store the response in RESULT
 
-    DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$DIFF_CONTENT" --arg api_model "$API_MODEL" "$JSON")
-
-    # Make the API call to OpenAI
-    RESPONSE=$(curl -s \
-                    -X POST "$API_BASE_URL/chat/completions" \
-                    -H "Content-Type: application/json" \
-                    -H "Authorization: Bearer $API_KEY" \
-                    -d "$DATA")
-
-    check_for_errors "$RESPONSE"
-
-    # Extract and display the answer
-    GPT_MESSAGE=$(echo $RESPONSE | jq -r '.choices[0].message.content' | sed 's/^"//;s/"$//')
   fi
-  
-  if [ -z "$RESULT" ]; then
-    RESULT=$(echo -e "${GPT_MESSAGE}")
-  else
-    RESULT=$(echo -e "${RESULT}" && echo -e "${GPT_MESSAGE}")
-  fi
+
 }
 
 
@@ -686,20 +455,6 @@ fi
 if [ "$ASSESS" = true ]; then
   assess_diff
 fi
-
 echo -e "${RESULT}"
 exit 0
 
-# Debugging tips:
-# 1. Run with -v flag to see verbose output
-# 2. For AWS Bedrock issues:
-#    - Check AWS credentials are correctly set (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)
-#    - Verify the AWS_REGION is correct (default: us-east-1)
-#    - Ensure the model ID is valid and accessible with your AWS account
-#    - Try the aws cli command manually to test connection:
-#      aws bedrock list-foundation-models --region us-east-1
-#
-# 3. Common model IDs:
-#    - Claude 3 Sonnet: anthropic.claude-3-sonnet-20240229-v1:0
-#    - Claude 3 Haiku: anthropic.claude-3-haiku-20240307-v1:0
-#    - Claude 2: anthropic.claude-v2:1
