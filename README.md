@@ -17,8 +17,8 @@ This multi-functional approach transforms your commit history into a more inform
 ## How It Works
 
 1. When you make a commit, GITPMOJI intercepts the commit message using a Git hook. So it works with all git clients and IDEs that use git hooks.
-2. The commit message and diff are sent to a custom script (`gpt.sh`) that communicates with the OpenAI API.
-3. The API, using the GPT-4o model, analyzes the commit message and the diff and updates the commit message.
+2. The commit message and diff are sent to a custom script (`gpt.sh`) that communicates with either OpenAI API or AWS Bedrock API.
+3. The API, using either OpenAI GPT-4o or AWS Bedrock Claude models, analyzes the commit message and the diff and updates the commit message.
 4. The suggested emoji is prepended to your original commit message.
 5. The AI generates a commit message based on the diff changes added to at the end of the original commit message.
 6. Rating of the commit message is added to the end of the commit message.
@@ -67,10 +67,17 @@ or
 apt-get install jq
 ```
 
+- if using AWS Bedrock, install AWS CLI
+```
+pip install awscli
+aws configure
+```
+
 - download `prepare-commit-msg.sh` and `gpt.sh`
 
-- Add environment variables to your `.env` file or create `.gitpmoji.env` file:
+- Add environment variables to your `.env` file or copy `.gitpmoji.env.sample` to `.gitpmoji.env` file and add your credentials:
 
+For OpenAI:
 ```
 GITPMOJI_API_KEY=your_openai_api_key
 GITPMOJI_PREFIX_RX="TICKET-[0-9]\{1,5\} \{0,1\}"
@@ -78,9 +85,21 @@ GITPMOJI_API_BASE_URL=https://api.openai.com/v1
 GITPMOJI_API_MODEL=gpt-4o
 ```
 
+For AWS Bedrock with Claude:
+```
+GITPMOJI_USE_BEDROCK=true
+GITPMOJI_AWS_REGION=us-east-1
+GITPMOJI_AWS_ACCESS_KEY_ID=your_aws_access_key
+GITPMOJI_AWS_SECRET_ACCESS_KEY=your_aws_secret_key
+GITPMOJI_BEDROCK_MODEL=anthropic.claude-3-7-sonnet-20250219-v1:0
+GITPMOJI_PREFIX_RX="TICKET-[0-9]\{1,5\} \{0,1\}"
+```
+
 > ❗ Note: 
 > - GITPMOJI_API_BASE_URL is optional and defaults to https://api.openai.com/v1
 > - GITPMOJI_API_MODEL is optional and defaults to gpt-4o
+> - GITPMOJI_BEDROCK_MODEL is optional and defaults to anthropic.claude-3-7-sonnet-20250219-v1:0
+> - GITPMOJI_AWS_REGION is optional and defaults to us-east-1
 
 - make sure to have `prepare-commit-msg.sh` and `gpt.sh` executable
 

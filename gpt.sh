@@ -10,21 +10,40 @@ if [ -f .gitpmoji.env ]; then
     source .gitpmoji.env
 fi
 
-# load from env variable
+# load from env variables
 API_KEY=$GITPMOJI_API_KEY
 API_BASE_URL=${GITPMOJI_API_BASE_URL:-https://api.openai.com/v1}
 API_MODEL=${GITPMOJI_API_MODEL:-gpt-4o}
+USE_BEDROCK=${GITPMOJI_USE_BEDROCK:-false}
+AWS_REGION=${GITPMOJI_AWS_REGION:-us-east-1}
+AWS_ACCESS_KEY_ID=${GITPMOJI_AWS_ACCESS_KEY_ID}
+AWS_SECRET_ACCESS_KEY=${GITPMOJI_AWS_SECRET_ACCESS_KEY}
+BEDROCK_MODEL=${GITPMOJI_BEDROCK_MODEL:-anthropic.claude-3-7-sonnet-20250219-v1:0}
 
-# check if API_KEY is set
-if [ -z "$API_KEY" ]; then
-    echo "GITPMOJI_API_KEY is not set"
-    exit 1
+# check if API_KEY is set for OpenAI or if Bedrock credentials are set
+if [ "$USE_BEDROCK" = "true" ]; then
+    if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+        echo "AWS credentials (GITPMOJI_AWS_ACCESS_KEY_ID and GITPMOJI_AWS_SECRET_ACCESS_KEY) are required when using Bedrock"
+        exit 1
+    fi
+else
+    if [ -z "$API_KEY" ]; then
+        echo "GITPMOJI_API_KEY is not set"
+        exit 1
+    fi
 fi
 
 # check if jq is installed
 if ! command -v jq &> /dev/null
 then
     echo "jq could not be found, please install it"
+    exit 1
+fi
+
+# check if aws cli is installed if using Bedrock
+if [ "$USE_BEDROCK" = "true" ] && ! command -v aws &> /dev/null
+then
+    echo "AWS CLI could not be found, please install it"
     exit 1
 fi
 
@@ -117,6 +136,10 @@ if [ "$VERBOSE" = true ]; then
   echo -e "MARKDOWN: $MARKDOWN"
   echo -e "MESSAGE: $MESSAGE"
   echo -e "EMOJI: $EMOJI"
+  echo -e "USE_BEDROCK: $USE_BEDROCK"
+  if [ "$USE_BEDROCK" = "true" ]; then
+    echo -e "BEDROCK_MODEL: $BEDROCK_MODEL"
+  fi
 fi
 
 # Check if both emoji and message are provided
@@ -154,17 +177,45 @@ get_diff_content() {
   fi
 }
 
+# Function to sign AWS requests for Bedrock API
+aws_signed_request() {
+  local data=$1
+  local response
+  
+  # Use AWS CLI to call Bedrock
+  response=$(AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
+             AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
+             aws bedrock-runtime invoke-model \
+             --region $AWS_REGION \
+             --model-id $BEDROCK_MODEL \
+             --content-type "application/json" \
+             --body "$data" \
+             /dev/stdout)
+  
+  echo "$response"
+}
 
 check_for_errors() {
   local response=$1
-  ERROR=$(echo $response | jq -r '.error.message')
-  if [ "$ERROR" == 'null' ]; then
-    return
-  fi
-  if [ "$ERROR" ]; then
-    echo -e "ERROR: $ERROR"
-    echo -e "RESPONSE: $response"
-    exit 1
+  if [ "$USE_BEDROCK" = "true" ]; then
+    # Check for Bedrock API errors
+    ERROR=$(echo $response | jq -r '.error // ""')
+    if [ -n "$ERROR" ] && [ "$ERROR" != "null" ]; then
+      echo -e "ERROR: $ERROR"
+      echo -e "RESPONSE: $response"
+      exit 1
+    fi
+  else
+    # Check for OpenAI API errors
+    ERROR=$(echo $response | jq -r '.error.message')
+    if [ "$ERROR" == 'null' ]; then
+      return
+    fi
+    if [ "$ERROR" ]; then
+      echo -e "ERROR: $ERROR"
+      echo -e "RESPONSE: $response"
+      exit 1
+    fi
   fi
 }
 
@@ -187,38 +238,69 @@ generate_message() {
 
   PREFIX_RX="\"" 
 
-  JSON='{
-    "model": $api_model,
-    "messages": [
-      {
-        "role": "system",
-        "content": $system_prompt
-      },
-      {
-        "role": "user",
-        "content": $prompt
-      }
-    ],
-    "max_tokens": 200,
-    "temperature": 0.999,
-    "top_p": 1,
-    "frequency_penalty": 0.0,
-    "presence_penalty": 0.0
-  }'
+  if [ "$USE_BEDROCK" = "true" ]; then
+    # Prepare data for Bedrock Claude API
+    BEDROCK_JSON='{
+      "anthropic_version": "bedrock-2023-05-31",
+      "max_tokens": 200,
+      "temperature": 0.999,
+      "top_p": 1,
+      "messages": [
+        {
+          "role": "system",
+          "content": $system_prompt
+        },
+        {
+          "role": "user",
+          "content": $prompt
+        }
+      ]
+    }'
+    
+    DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$DIFF_CONTENT" "$BEDROCK_JSON")
+    
+    # Make the API call to AWS Bedrock
+    RESPONSE=$(aws_signed_request "$DATA")
+    
+    check_for_errors "$RESPONSE"
+    
+    # Extract and display the answer from Claude response
+    GPT_MESSAGE=$(echo $RESPONSE | jq -r '.content[0].text')
+  else
+    # Original OpenAI API call
+    JSON='{
+      "model": $api_model,
+      "messages": [
+        {
+          "role": "system",
+          "content": $system_prompt
+        },
+        {
+          "role": "user",
+          "content": $prompt
+        }
+      ],
+      "max_tokens": 200,
+      "temperature": 0.999,
+      "top_p": 1,
+      "frequency_penalty": 0.0,
+      "presence_penalty": 0.0
+    }'
 
-  DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$DIFF_CONTENT" --arg api_model "$API_MODEL" "$JSON")
+    DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$DIFF_CONTENT" --arg api_model "$API_MODEL" "$JSON")
 
-  # Make the API call
-  RESPONSE=$(curl -s \
-                  -X POST "$API_BASE_URL/chat/completions" \
-                  -H "Content-Type: application/json" \
-                  -H "Authorization: Bearer $API_KEY" \
-                  -d "$DATA")
+    # Make the API call to OpenAI
+    RESPONSE=$(curl -s \
+                    -X POST "$API_BASE_URL/chat/completions" \
+                    -H "Content-Type: application/json" \
+                    -H "Authorization: Bearer $API_KEY" \
+                    -d "$DATA")
 
-  check_for_errors "$RESPONSE"
+    check_for_errors "$RESPONSE"
 
-  # Extract and display the answer
-  GPT_MESSAGE=$(echo $RESPONSE | jq -r '.choices[0].message.content' | sed 's/^"//;s/"$//')
+    # Extract and display the answer
+    GPT_MESSAGE=$(echo $RESPONSE | jq -r '.choices[0].message.content' | sed 's/^"//;s/"$//')
+  fi
   
   if [ -z "$MESSAGE" ]; then
     MESSAGE=$(echo -e "${GPT_MESSAGE}")
@@ -308,38 +390,69 @@ generate_emoji() {
 
   PREFIX_RX="\"" 
 
-  JSON='{
-    "model": $api_model,
-    "messages": [
-      {
-        "role": "system",
-        "content": $system_prompt
-      },
-      {
-        "role": "user",
-        "content": $prompt
-      }
-    ],
-    "max_tokens": 100,
-    "temperature": 0.999,
-    "top_p": 1,
-    "frequency_penalty": 0.0,
-    "presence_penalty": 0.0
-  }'
+  if [ "$USE_BEDROCK" = "true" ]; then
+    # Prepare data for Bedrock Claude API
+    BEDROCK_JSON='{
+      "anthropic_version": "bedrock-2023-05-31",
+      "max_tokens": 100,
+      "temperature": 0.999,
+      "top_p": 1,
+      "messages": [
+        {
+          "role": "system",
+          "content": $system_prompt
+        },
+        {
+          "role": "user",
+          "content": $prompt
+        }
+      ]
+    }'
+    
+    DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$MESSAGE" "$BEDROCK_JSON")
+    
+    # Make the API call to AWS Bedrock
+    RESPONSE=$(aws_signed_request "$DATA")
+    
+    check_for_errors "$RESPONSE"
+    
+    # Extract and display the answer from Claude response
+    EMOJI=$(echo $RESPONSE | jq -r '.content[0].text')
+  else
+    # Original OpenAI API call
+    JSON='{
+      "model": $api_model,
+      "messages": [
+        {
+          "role": "system",
+          "content": $system_prompt
+        },
+        {
+          "role": "user",
+          "content": $prompt
+        }
+      ],
+      "max_tokens": 100,
+      "temperature": 0.999,
+      "top_p": 1,
+      "frequency_penalty": 0.0,
+      "presence_penalty": 0.0
+    }'
 
-  DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$MESSAGE" --arg api_model "$API_MODEL" "$JSON")
+    DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$MESSAGE" --arg api_model "$API_MODEL" "$JSON")
 
-  # Make the API call
-  RESPONSE=$(curl -s \
-                  -X POST "$API_BASE_URL/chat/completions" \
-                  -H "Content-Type: application/json" \
-                  -H "Authorization: Bearer $API_KEY" \
-                  -d "$DATA")
+    # Make the API call to OpenAI
+    RESPONSE=$(curl -s \
+                    -X POST "$API_BASE_URL/chat/completions" \
+                    -H "Content-Type: application/json" \
+                    -H "Authorization: Bearer $API_KEY" \
+                    -d "$DATA")
 
-  check_for_errors "$RESPONSE"
+    check_for_errors "$RESPONSE"
 
-  # Extract and display the answer
-  EMOJI=$(echo $RESPONSE | jq -r '.choices[0].message.content' | sed 's/^"//;s/"$//')
+    # Extract and display the answer
+    EMOJI=$(echo $RESPONSE | jq -r '.choices[0].message.content' | sed 's/^"//;s/"$//')
+  fi
 
   PREFIX="###"
 
@@ -392,38 +505,69 @@ assess_diff() {
     SYSTEM_PROMPT=$(echo -e "${SYSTEM_PROMPT}""${RATING_PROMPT}")
   fi
 
-  JSON='{
-    "model": $api_model,
-    "messages": [
-      {
-        "role": "system",
-        "content": $system_prompt
-      },
-      {
-        "role": "user",
-        "content": $prompt
-      }
-    ],
-    "max_tokens": 500,
-    "temperature": 1,
-    "top_p": 1,
-    "frequency_penalty": 0.0,
-    "presence_penalty": 0.0
-  }'
+  if [ "$USE_BEDROCK" = "true" ]; then
+    # Prepare data for Bedrock Claude API
+    BEDROCK_JSON='{
+      "anthropic_version": "bedrock-2023-05-31",
+      "max_tokens": 500,
+      "temperature": 1,
+      "top_p": 1,
+      "messages": [
+        {
+          "role": "system",
+          "content": $system_prompt
+        },
+        {
+          "role": "user",
+          "content": $prompt
+        }
+      ]
+    }'
+    
+    DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$DIFF_CONTENT" "$BEDROCK_JSON")
+    
+    # Make the API call to AWS Bedrock
+    RESPONSE=$(aws_signed_request "$DATA")
+    
+    check_for_errors "$RESPONSE"
+    
+    # Extract and display the answer from Claude response
+    GPT_MESSAGE=$(echo $RESPONSE | jq -r '.content[0].text')
+  else
+    # Original OpenAI API call
+    JSON='{
+      "model": $api_model,
+      "messages": [
+        {
+          "role": "system",
+          "content": $system_prompt
+        },
+        {
+          "role": "user",
+          "content": $prompt
+        }
+      ],
+      "max_tokens": 500,
+      "temperature": 1,
+      "top_p": 1,
+      "frequency_penalty": 0.0,
+      "presence_penalty": 0.0
+    }'
 
-  DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$DIFF_CONTENT" --arg api_model "$API_MODEL" "$JSON")
+    DATA=$(jq -n --arg system_prompt "$SYSTEM_PROMPT" --arg prompt "$DIFF_CONTENT" --arg api_model "$API_MODEL" "$JSON")
 
-  # Make the API call
-  RESPONSE=$(curl -s \
-                  -X POST "$API_BASE_URL/chat/completions" \
-                  -H "Content-Type: application/json" \
-                  -H "Authorization: Bearer $API_KEY" \
-                  -d "$DATA")
+    # Make the API call to OpenAI
+    RESPONSE=$(curl -s \
+                    -X POST "$API_BASE_URL/chat/completions" \
+                    -H "Content-Type: application/json" \
+                    -H "Authorization: Bearer $API_KEY" \
+                    -d "$DATA")
 
-  check_for_errors "$RESPONSE"
+    check_for_errors "$RESPONSE"
 
-  # Extract and display the answer
-  GPT_MESSAGE=$(echo $RESPONSE | jq -r '.choices[0].message.content' | sed 's/^"//;s/"$//')
+    # Extract and display the answer
+    GPT_MESSAGE=$(echo $RESPONSE | jq -r '.choices[0].message.content' | sed 's/^"//;s/"$//')
+  fi
   
   if [ -z "$RESULT" ]; then
     RESULT=$(echo -e "${GPT_MESSAGE}")
